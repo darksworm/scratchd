@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ pub async fn run(hypr: Hypr, opts: Options) -> Result<()> {
         peers: RwLock::new(HashMap::new()),
         confs: RwLock::new(HashMap::new()),
         log_dir: opts.log_dir.clone(),
+        presses: AtomicU64::new(1),
     });
     reload(&shared, &opts.config).await;
     tokio::spawn(events(shared.clone()));
@@ -231,7 +233,9 @@ async fn command(line: &str, shared: &Arc<Shared>, config: &Path, exit: &mpsc::S
     let mut words = line.split_whitespace();
     let verb = words.next().unwrap_or("");
     let names: Vec<&str> = words.collect();
-    let each = |mk: fn() -> Msg| -> Result<String> {
+    // one number per command: `toggle a b` shows both without them excluding each other
+    let press = shared.presses.fetch_add(1, Ordering::Relaxed);
+    let each = |mk: &dyn Fn() -> Msg| -> Result<String> {
         if names.is_empty() {
             bail!("usage: {verb} <scratchpad>...");
         }
@@ -244,9 +248,9 @@ async fn command(line: &str, shared: &Arc<Shared>, config: &Path, exit: &mpsc::S
         if errors.is_empty() { Ok("ok".into()) } else { bail!("{}", errors.join("; ")) }
     };
     match verb {
-        "toggle" => each(|| Msg::Toggle),
-        "show" => each(|| Msg::Show),
-        "hide" => each(|| Msg::Hide),
+        "toggle" => each(&|| Msg::Toggle { press }),
+        "show" => each(&|| Msg::Show { press }),
+        "hide" => each(&|| Msg::Hide),
         "ping" => Ok("pong".into()),
         "reload" => {
             reload(shared, config).await;

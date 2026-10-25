@@ -7,11 +7,17 @@
 //!
 //! Visibility is read from Hyprland on every command instead of being
 //! tracked, so the actor can't drift from what's on screen.
+//!
+//! Actors run concurrently, so `excludes` could otherwise race: two keys
+//! pressed together would each hide the other. Every press gets a number
+//! from a shared counter and an exclusion from an earlier press than the
+//! one that showed us is ignored, so the last key pressed wins.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -32,11 +38,11 @@ const SPAWN_POLL: Duration = Duration::from_millis(150);
 pub const NOANIM_TAG: &str = "scratchd_noanim";
 
 pub enum Msg {
-    Toggle,
-    Show,
+    Toggle { press: u64 },
+    Show { press: u64 },
     Hide,
-    /// Another scratchpad was shown and excludes this one.
-    Excluded,
+    /// Another scratchpad was shown for `press` and excludes this one.
+    Excluded { press: u64 },
     Focus { addr: String, class: String },
     Opened,
     Closed { addr: String },
@@ -53,12 +59,16 @@ pub struct Shared {
     pub peers: RwLock<HashMap<String, mpsc::Sender<Msg>>>,
     pub confs: RwLock<HashMap<String, Arc<ScratchConf>>>,
     pub log_dir: PathBuf,
+    /// Numbers key presses, see the module docs.
+    pub presses: AtomicU64,
 }
 
 struct Spawn {
     epoch: u64,
     started: Instant,
     want_visible: bool,
+    /// The press that last asked for it to be shown.
+    press: u64,
 }
 
 pub struct Actor {
@@ -72,6 +82,12 @@ pub struct Actor {
     last_shown: Option<Instant>,
     /// What we last did; only a hint for the unfocus check.
     shown: bool,
+    /// The press that last showed us.
+    shown_press: u64,
+    /// The app's other windows that moved with the last show, and their
+    /// offsets from the main window saved at the last hide.
+    extras: HashSet<String>,
+    extra_offsets: HashMap<String, (i32, i32)>,
     unfocus_gen: u64,
 }
 
@@ -93,6 +109,9 @@ impl Actor {
             epoch: 0,
             last_shown: None,
             shown: false,
+            shown_press: 0,
+            extras: HashSet::new(),
+            extra_offsets: HashMap::new(),
             unfocus_gen: 0,
         }
     }
@@ -116,19 +135,28 @@ impl Actor {
 
     async fn handle(&mut self, msg: Msg) -> Result<()> {
         match msg {
-            Msg::Toggle => match &mut self.spawn {
+            Msg::Toggle { press } => match &mut self.spawn {
                 Some(sp) => {
                     sp.want_visible = !sp.want_visible;
+                    sp.press = press;
                     info!("{}: still launching, will {} it", self.conf.name, if sp.want_visible { "show" } else { "hide" });
                 }
-                None => self.toggle().await?,
+                None => self.toggle(press).await?,
             },
-            Msg::Show => match &mut self.spawn {
-                Some(sp) => sp.want_visible = true,
-                None => self.show_or_launch().await?,
+            Msg::Show { press } => match &mut self.spawn {
+                Some(sp) => (sp.want_visible, sp.press) = (true, press),
+                None => self.show_or_launch(press).await?,
             },
-            Msg::Hide | Msg::Excluded => match &mut self.spawn {
+            Msg::Hide => match &mut self.spawn {
                 Some(sp) => sp.want_visible = false,
+                None => self.hide_if_out().await?,
+            },
+            Msg::Excluded { press } => match &mut self.spawn {
+                Some(sp) if press > sp.press => sp.want_visible = false,
+                Some(_) => {}
+                None if press <= self.shown_press => {
+                    debug!("{}: ignoring exclusion from an earlier press", self.conf.name);
+                }
                 None => self.hide_if_out().await?,
             },
             Msg::Focus { addr, class } => self.on_focus(&addr, &class),
@@ -156,6 +184,8 @@ impl Actor {
                 }
             }
             Msg::Closed { addr } => {
+                self.extras.remove(&addr);
+                self.extra_offsets.remove(&addr);
                 if self.addr.as_deref() == Some(addr.as_str()) {
                     debug!("{}: window {addr} closed", self.name());
                     self.addr = None;
@@ -166,7 +196,7 @@ impl Actor {
             Msg::UnfocusFire { epoch } => {
                 if epoch == self.unfocus_gen {
                     let active = self.hypr().active_window().await?.address;
-                    if self.addr.as_deref() != Some(active.as_str()) {
+                    if self.addr.as_deref() != Some(active.as_str()) && !self.extras.contains(&active) {
                         debug!("{}: hiding, focus moved away", self.name());
                         self.hide_if_out().await?;
                     }
@@ -183,6 +213,7 @@ impl Actor {
                         "show_when_ready": s.want_visible,
                     })),
                     "shown": self.shown,
+                    "extras": self.extras,
                 }));
             }
         }
@@ -209,6 +240,24 @@ impl Actor {
         Some(c.clone())
     }
 
+    /// The app's other windows: same class (or same match when no class is
+    /// configured), minus anything parked in another scratchpad.
+    fn extra_windows<'a>(&self, clients: &'a [Client], main: &Client) -> Vec<&'a Client> {
+        if !self.conf.multi {
+            return vec![];
+        }
+        let own = self.conf.workspace();
+        clients
+            .iter()
+            .filter(|c| c.address != main.address && c.mapped)
+            .filter(|c| !c.workspace.name.starts_with("special:S-") || c.workspace.name == own)
+            .filter(|c| match &self.conf.class {
+                Some(p) => p.matches(&c.class),
+                None => self.conf.matcher.matches(c, self.spawned_pid),
+            })
+            .collect()
+    }
+
     fn presence(&self, c: &Client, mon: &Monitor) -> Present {
         let ws = c.workspace.name.as_str();
         if ws == mon.active_workspace.name
@@ -222,33 +271,34 @@ impl Actor {
         }
     }
 
-    async fn toggle(&mut self) -> Result<()> {
+    async fn toggle(&mut self, press: u64) -> Result<()> {
         let (clients, monitors) = self.snapshot().await?;
         let mon = focused(&monitors)?;
         match self.find(&clients) {
-            None => self.launch(true).await,
+            None => self.launch(true, press).await,
             Some(c) => match self.presence(&c, mon) {
-                Present::Here => self.hide(&c, &monitors).await,
-                Present::Elsewhere | Present::Hidden => self.show(&c, mon).await,
+                Present::Here => self.hide(&c, &clients, &monitors).await,
+                Present::Elsewhere | Present::Hidden => self.show(&c, &clients, mon, press).await,
             },
         }
     }
 
-    async fn show_or_launch(&mut self) -> Result<()> {
+    async fn show_or_launch(&mut self, press: u64) -> Result<()> {
         let (clients, monitors) = self.snapshot().await?;
         let mon = focused(&monitors)?;
         match self.find(&clients) {
-            None => self.launch(true).await,
-            Some(c) => self.show(&c, mon).await,
+            None => self.launch(true, press).await,
+            Some(c) => self.show(&c, &clients, mon, press).await,
         }
     }
 
     async fn hide_if_out(&mut self) -> Result<()> {
         let (clients, monitors) = self.snapshot().await?;
         if let Some(c) = self.find(&clients)
-            && c.workspace.name != self.conf.workspace() {
-                self.hide(&c, &monitors).await?;
-            }
+            && c.workspace.name != self.conf.workspace()
+        {
+            self.hide(&c, &clients, &monitors).await?;
+        }
         self.shown = false;
         Ok(())
     }
@@ -258,25 +308,26 @@ impl Actor {
         let clients = self.hypr().clients().await?;
         match self.find(&clients) {
             Some(c) => self.shown = c.workspace.name != self.conf.workspace(),
-            None if !self.conf.lazy => self.launch(false).await?,
+            None if !self.conf.lazy => self.launch(false, 0).await?,
             None => {}
         }
         Ok(())
     }
 
-    fn exclude_others(&self) {
+    fn exclude_others(&self, press: u64) {
         let peers = self.shared.peers.read().unwrap();
         for (name, tx) in peers.iter().filter(|(n, _)| self.conf.excludes(n)) {
-            if tx.try_send(Msg::Excluded).is_err() {
+            if tx.try_send(Msg::Excluded { press }).is_err() {
                 warn!("{}: couldn't ask {name} to hide (queue full)", self.conf.name);
             }
         }
     }
 
-    async fn show(&mut self, c: &Client, mon: &Monitor) -> Result<()> {
+    async fn show(&mut self, c: &Client, clients: &[Client], mon: &Monitor, press: u64) -> Result<()> {
         info!("{}: show", self.name());
         self.unfocus_gen += 1;
-        self.exclude_others();
+        self.shown_press = press;
+        self.exclude_others(press);
         let conf = self.conf.clone();
         let addr = c.address.as_str();
         let hypr = self.hypr().clone();
@@ -326,11 +377,29 @@ impl Actor {
             }
             None => resting(conf.animation, mon, (w, h), conf.margin),
         };
-        let mut stage = vec![dsp::move_to(addr, x, y), dsp::focus(addr)];
+        let mut stage = vec![dsp::move_to(addr, x, y)];
         // read the pin state instead of blindly toggling, so it can't drift
         if conf.pinned != c.pinned {
             stage.push(dsp::toggle_pin(addr));
         }
+        // bring back the windows that hid with it, where they were relative to it
+        let own = conf.workspace();
+        let extras: Vec<Client> =
+            self.extra_windows(clients, c).into_iter().filter(|e| e.workspace.name == own).cloned().collect();
+        self.extras = extras.iter().map(|e| e.address.clone()).collect();
+        for e in &extras {
+            let (ex, ey) = match self.extra_offsets.get(&e.address) {
+                Some((dx, dy)) => (x + dx, y + dy),
+                None => resting(None, mon, (e.size[0], e.size[1]), 0),
+            };
+            stage.push(dsp::to_workspace(&e.address, target));
+            stage.push(dsp::move_to(&e.address, ex, ey));
+            if conf.pinned != e.pinned {
+                stage.push(dsp::toggle_pin(&e.address));
+            }
+        }
+        stage.extend(extras.iter().map(|e| dsp::raise(&e.address)));
+        stage.push(dsp::focus(addr));
         hypr.eval(&stage).await?;
         self.last_shown = Some(Instant::now());
         self.shown = true;
@@ -343,7 +412,7 @@ impl Actor {
         Ok(())
     }
 
-    async fn hide(&mut self, c: &Client, monitors: &[Monitor]) -> Result<()> {
+    async fn hide(&mut self, c: &Client, clients: &[Client], monitors: &[Monitor]) -> Result<()> {
         info!("{}: hide", self.name());
         self.unfocus_gen += 1;
         self.shown = false;
@@ -352,6 +421,22 @@ impl Actor {
         let hypr = self.hypr().clone();
         let mon = monitors.iter().find(|m| m.id == c.monitor).map_or_else(|| focused(monitors), Ok)?;
         let size = (c.size[0], c.size[1]);
+
+        // the app's other windows next to it (a call, a dialog) go first, so
+        // they don't linger while the main window slides out
+        let extras: Vec<&Client> =
+            self.extra_windows(clients, c).into_iter().filter(|e| e.workspace.name == c.workspace.name).collect();
+        if !extras.is_empty() {
+            let mut stage = vec![];
+            for e in &extras {
+                self.extra_offsets.insert(e.address.clone(), (e.at[0] - c.at[0], e.at[1] - c.at[1]));
+                if e.pinned {
+                    stage.push(dsp::toggle_pin(&e.address));
+                }
+                stage.push(dsp::to_workspace(&e.address, &conf.workspace()));
+            }
+            hypr.eval(&stage).await?;
+        }
 
         if let Some(anim) = conf.animation {
             let (x, y) = slide_out(anim, (c.at[0], c.at[1]), size, conf.margin);
@@ -400,7 +485,7 @@ impl Actor {
 
     /// Start the command and return right away; `poll_spawn` picks the
     /// window up from `openwindow` events or the poll ticks.
-    async fn launch(&mut self, want_visible: bool) -> Result<()> {
+    async fn launch(&mut self, want_visible: bool, press: u64) -> Result<()> {
         let Some(cmd) = self.conf.command.clone() else {
             self.fail("no matching window and no command to start one").await;
             return Ok(());
@@ -431,7 +516,7 @@ impl Actor {
         };
         self.spawned_pid = child.id();
         info!("{}: launching `{cmd}` (pid {:?}, output in {})", self.conf.name, self.spawned_pid, log_path.display());
-        self.spawn = Some(Spawn { epoch, started: Instant::now(), want_visible });
+        self.spawn = Some(Spawn { epoch, started: Instant::now(), want_visible, press });
 
         let Some(tx) = self.me.upgrade() else { return Ok(()) };
         let exit_tx = tx.clone();
@@ -459,14 +544,14 @@ impl Actor {
     async fn poll_spawn(&mut self) -> Result<()> {
         let clients = self.hypr().clients().await?;
         let Some(sp) = &self.spawn else { return Ok(()) };
-        let (want, took, timeout) = (sp.want_visible, sp.started.elapsed(), self.conf.spawn_timeout);
+        let (want, press, took, timeout) = (sp.want_visible, sp.press, sp.started.elapsed(), self.conf.spawn_timeout);
         match self.find(&clients) {
             Some(c) => {
                 info!("{}: window appeared after {:.1}s", self.conf.name, took.as_secs_f64());
                 self.spawn = None;
                 if want {
                     let monitors = self.hypr().monitors().await?;
-                    self.show(&c, focused(&monitors)?).await?;
+                    self.show(&c, &clients, focused(&monitors)?, press).await?;
                 } else {
                     let mut stage = vec![];
                     if !c.floating {

@@ -21,6 +21,13 @@ freezes every other scratchpad key until the wait runs out.
   Hyprland notification right away; one that never opens a window does so
   after `spawn_timeout`. App output goes to
   `~/.local/state/scratchd/<name>.log`.
+- **Last key wins.** With `excludes`, two keys pressed together could each
+  hide the other now that scratchpads run concurrently. Every press is
+  numbered, and an exclusion from an older press than the one that showed a
+  scratchpad is ignored.
+- **The app's other windows come along.** A call window or dialog of the
+  same class, sitting on the scratchpad's workspace, hides with it and
+  returns at the same offset (`multi = false` turns this off).
 - **No tracked visibility.** Window placement and pin state are read from
   Hyprland on each command, so the daemon can't drift from what's on screen.
 - **Fast client.** `scratchd toggle x` is a synchronous connect, write and
@@ -85,6 +92,7 @@ pinned = false
 | `excludes` | | names, or `"*"` |
 | `hide_delay` | `0.2` | seconds for the slide-out animation |
 | `spawn_timeout` | `20` | seconds to wait for a window |
+| `multi` | `true` | move the app's other windows along with it |
 
 Differences from pyprland:
 
@@ -92,7 +100,9 @@ Differences from pyprland:
   matching misses apps that re-exec through wrappers (snap, flatpak).
 - Focusing another window of the same class (an app's own popups) doesn't
   trigger `unfocus` hiding.
-- `multi`, `smart_focus`, `use`, per-monitor overrides and the other pyprland
+- Other windows of the app are found by `class` (or the match rule when no
+  class is set), and only the ones on the scratchpad's workspace go with it.
+- `smart_focus`, `use`, per-monitor overrides and the other pyprland
   plugins aren't implemented; their keys are ignored with a warning, and an
   invalid scratchpad is skipped without affecting the rest.
 
@@ -104,4 +114,6 @@ cargo test
 
 `tests/isolation.rs` runs the daemon against a fake Hyprland socket and
 checks that a scratchpad stuck launching doesn't delay another, that a failing
-command is reported immediately, and that toggling during a launch is honoured.
+command is reported immediately, that toggling during a launch is honoured,
+that the last of two racing keys wins, and that an app's extra windows move
+with it.

@@ -18,6 +18,8 @@ struct State {
     evals: Vec<String>,
     notifies: Vec<String>,
     events: Option<UnixStream>,
+    /// Added to every query, like a busy compositor.
+    latency: Duration,
 }
 
 struct Fake {
@@ -50,6 +52,10 @@ impl Fake {
                     let mut buf = vec![0; 65536];
                     let n = s.read(&mut buf).await.unwrap();
                     let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let latency = st.lock().unwrap().latency;
+                    if req.starts_with("j/") && !latency.is_zero() {
+                        tokio::time::sleep(latency).await;
+                    }
                     let reply = respond(&st, &req);
                     let _ = s.write_all(reply.as_bytes()).await;
                 });
@@ -100,6 +106,32 @@ impl Fake {
         }
         let s = self.state.lock().unwrap();
         panic!("condition not met in {limit:?}\nevals: {:#?}\nnotifies: {:#?}", s.evals, s.notifies);
+    }
+
+    fn workspace(&self, addr: &str) -> String {
+        let s = self.state.lock().unwrap();
+        let c = s.clients.iter().find(|c| c["address"] == addr).expect("client exists");
+        c["workspace"]["name"].as_str().unwrap().to_owned()
+    }
+
+    fn set_workspace(&self, addr: &str, ws: &str) {
+        let mut s = self.state.lock().unwrap();
+        for c in s.clients.iter_mut().filter(|c| c["address"] == addr) {
+            c["workspace"]["name"] = json!(ws);
+        }
+    }
+
+    /// Wait until no evals arrive for a while.
+    async fn settle(&self) {
+        let mut last = usize::MAX;
+        loop {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let n = self.state.lock().unwrap().evals.len();
+            if n == last {
+                return;
+            }
+            last = n;
+        }
     }
 }
 
@@ -227,4 +259,88 @@ async fn unknown_scratchpad_is_an_error_not_a_hang() {
     let fake = Fake::start("[scratchpads.a]\ncommand = \"true\"\nclass = \"a\"\n", vec![]).await;
     let reply = fake.ctl("toggle nope").await;
     assert!(reply.starts_with("error:") && reply.contains("nope"), "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_key_pressed_wins_when_two_exclusive_scratchpads_race() {
+    let fake = Fake::start(
+        r#"
+[scratchpads.a]
+command = "true"
+class = "a"
+excludes = "*"
+
+[scratchpads.b]
+command = "true"
+class = "b"
+excludes = "*"
+"#,
+        vec![client("0xaa", "a", "special:S-a"), client("0xbb", "b", "special:S-b")],
+    )
+    .await;
+    // slow enough that both actors are mid-show when the other's exclusion arrives
+    fake.state.lock().unwrap().latency = Duration::from_millis(30);
+
+    for (first, second) in [("a", "b"), ("b", "a"), ("a", "b"), ("b", "a"), ("a", "b")] {
+        fake.set_workspace("0xaa", "special:S-a");
+        fake.set_workspace("0xbb", "special:S-b");
+        // both presses land before either actor has finished showing
+        let (cmd1, cmd2) = (format!("toggle {first}"), format!("toggle {second}"));
+        let (r1, r2) = tokio::join!(fake.ctl(&cmd1), async {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            fake.ctl(&cmd2).await
+        });
+        assert_eq!((r1.as_str(), r2.as_str()), ("ok", "ok"));
+        fake.settle().await;
+        let addr = |n: &str| if n == "a" { "0xaa" } else { "0xbb" };
+        assert_eq!(fake.workspace(addr(second)), "1", "{second} was pressed last and should be showing");
+        assert_eq!(fake.workspace(addr(first)), format!("special:S-{first}"), "{first} should have been hidden");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn other_windows_of_the_app_hide_and_return_with_it() {
+    let mut call = client("0xca11", "app", "1");
+    call["at"] = json!([300, 250]);
+    let fake = Fake::start(
+        r#"
+[scratchpads.app]
+command = "true"
+class = "app"
+position = "10% 10%"
+animation = ""
+
+[scratchpads.solo]
+command = "true"
+class = "solo"
+multi = false
+"#,
+        vec![
+            client("0xa1", "app", "1"),
+            call,
+            client("0x07e2", "other", "1"),
+            client("0x5010", "solo", "1"),
+            client("0x5011", "solo", "1"),
+        ],
+    )
+    .await;
+
+    fake.ctl("toggle app").await;
+    fake.settle().await;
+    assert_eq!(fake.workspace("0xa1"), "special:S-app");
+    assert_eq!(fake.workspace("0xca11"), "special:S-app", "the app's second window should hide too");
+    assert_eq!(fake.workspace("0x07e2"), "1", "unrelated windows stay");
+
+    fake.ctl("toggle app").await;
+    fake.settle().await;
+    assert_eq!(fake.workspace("0xa1"), "1");
+    assert_eq!(fake.workspace("0xca11"), "1");
+    // main lands at 10% of 2560x1440 = (256, 144); the call keeps its (200, 150) offset
+    let moved = r#"hl.dsp.window.move({x=456, y=294, window="address:0xca11"})"#;
+    assert!(fake.state.lock().unwrap().evals.iter().any(|e| e.contains(moved)));
+
+    fake.ctl("toggle solo").await;
+    fake.settle().await;
+    assert_eq!(fake.workspace("0x5010"), "special:S-solo");
+    assert_eq!(fake.workspace("0x5011"), "1", "multi = false leaves other windows alone");
 }

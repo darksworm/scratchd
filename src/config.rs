@@ -42,6 +42,7 @@ struct Raw {
     excludes: Option<OneOrMany>,
     hide_delay: Option<f64>,
     spawn_timeout: Option<f64>,
+    multi: Option<bool>,
 }
 
 /// Accepted so pypr configs load cleanly; scratchd never tracks or kills
@@ -51,7 +52,7 @@ const IGNORED_KEYS: &[&str] = &["process_tracking"];
 const KNOWN_KEYS: &[&str] = &[
     "command", "class", "match_by", "initialClass", "initialTitle", "title", "animation", "size",
     "position", "max_size", "margin", "lazy", "pinned", "unfocus", "hysteresis", "excludes",
-    "hide_delay", "spawn_timeout",
+    "hide_delay", "spawn_timeout", "multi",
 ];
 
 #[derive(Clone, Debug)]
@@ -152,6 +153,8 @@ pub struct ScratchConf {
     pub exclude_names: Vec<String>,
     pub hide_delay: Duration,
     pub spawn_timeout: Duration,
+    /// Move the app's other windows along with the main one.
+    pub multi: bool,
 }
 
 impl ScratchConf {
@@ -220,6 +223,7 @@ impl ScratchConf {
             exclude_names,
             hide_delay: secs(raw.hide_delay, 0.2),
             spawn_timeout: secs(raw.spawn_timeout, 20.0),
+            multi: raw.multi.unwrap_or(true),
         })
     }
 }
@@ -300,7 +304,7 @@ animation = "sideways"
 
 [scratchpads.odd]
 command = "y"
-multi = false
+smart_focus = true
 "#;
 
     #[test]
@@ -309,7 +313,7 @@ multi = false
         let names: Vec<_> = loaded.scratches.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["discord", "odd", "slack"]);
         assert!(loaded.errors.iter().any(|e| e.contains("broken") && e.contains("sideways")));
-        assert!(loaded.errors.iter().any(|e| e.contains("`multi`")));
+        assert!(loaded.errors.iter().any(|e| e.contains("`smart_focus`")));
 
         let slack = loaded.scratches.iter().find(|s| s.name == "slack").unwrap();
         assert!(slack.unfocus_hide && !slack.pinned && slack.lazy);
